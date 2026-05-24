@@ -1,4 +1,5 @@
 import React, { createContext, useState, useContext, useEffect } from 'react';
+import { registerUser } from '../api/api';
 
 const AuthContext = createContext();
 
@@ -6,59 +7,39 @@ export const useAuth = () => useContext(AuthContext);
 
 export const AuthProvider = ({ children }) => {
     const [isAuthenticated, setIsAuthenticated] = useState(false);
-    const [telegramId, setTelegramId] = useState(null);
-    const [nickname, setNickname] = useState('');
-    const [dorm, setDorm] = useState('Корпус 8.1');
+    const [user, setUser] = useState(null); // { id, nickname, tag, dorm, telegram_id }
 
-    // Восстановление сессии из localStorage
     useEffect(() => {
-        const storedId = localStorage.getItem('telegram_id');
-        const storedNick = localStorage.getItem('nickname');
-        const storedDorm = localStorage.getItem('dorm');
-        if (storedId && storedNick) {
-            setTelegramId(storedId);
-            setNickname(storedNick);
-            setDorm(storedDorm || 'Корпус 8.1');
+        const storedUser = localStorage.getItem('user');
+        if (storedUser) {
+            const u = JSON.parse(storedUser);
+            setUser(u);
             setIsAuthenticated(true);
         }
     }, []);
 
-    const login = (tgId, nick, selectedDorm) => {
-        setTelegramId(tgId);
-        setNickname(nick);
-        setDorm(selectedDorm);
+    const register = async (nickname, tag, dorm, telegramId = null) => {
+        const newUser = await registerUser(nickname, tag, dorm, telegramId);
+        setUser(newUser);
         setIsAuthenticated(true);
-        localStorage.setItem('telegram_id', tgId);
-        localStorage.setItem('nickname', nick);
-        localStorage.setItem('dorm', selectedDorm);
+        localStorage.setItem('user', JSON.stringify(newUser));
+        return newUser;
+    };
+
+    const updateNickname = (newNickname) => {
+        if (!user) return;
+        const updated = { ...user, nickname: newNickname };
+        setUser(updated);
+        localStorage.setItem('user', JSON.stringify(updated));
+        alert('Ник изменён локально');
     };
 
     const logout = () => {
+        setUser(null);
         setIsAuthenticated(false);
-        setTelegramId(null);
-        setNickname('');
-        setDorm('');
-        localStorage.clear();
+        localStorage.removeItem('user');
     };
 
-    const updateNickname = async (newNick) => {
-        if (telegramId) {
-            // здесь можно вызвать API, но для демо просто меняем локально
-            setNickname(newNick);
-            localStorage.setItem('nickname', newNick);
-            alert('Ник изменён');
-        }
-    };
-
-    const value = {
-        isAuthenticated,
-        telegramId,
-        nickname,
-        dorm,
-        login,
-        logout,
-        updateNickname
-    };
-
+    const value = { isAuthenticated, user, register, updateNickname, logout };
     return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };

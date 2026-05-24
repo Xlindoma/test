@@ -1,51 +1,233 @@
 const express = require('express');
 const multer = require('multer');
-const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
+const cors = require('cors');
+const { initDB, db } = require('./db');
 
 const app = express();
-const upload = multer({ dest: 'uploads/' });
+const PORT = 8001;
+const BOT_USERNAME = 'TytShare_BoT';
 
+// Middleware
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
+app.use(express.urlencoded({ extended: true }));
 
-// Мок‑данные
-let items = [
-  {
-    id: 1,
-    title: 'Книга по React',
-    description: 'Почти новая',
-    category: 'Книги',
-    owner_telegram_id: '123',
-    owner_nick: '@student',
-    owner_trust: 4,
-    photo_path: 'uploads/placeholder.jpg',
-    status: 'active',
-    claimers: []
-  }
-];
+// Папка для загрузок
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
+app.use('/uploads', express.static(uploadsDir));
 
-app.get('/api/items', (req, res) => res.json(items));
+// Настройка multer
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadsDir),
+    filename: (req, file, cb) => {
+        const unique = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, unique + path.extname(file.originalname));
+    }
+});
+const upload = multer({ storage });
 
-app.post('/api/items', upload.single('photo'), (req, res) => {
-  const newItem = {
-    id: Date.now(),
-    ...req.body,
-    photo_path: req.file ? req.file.path : '',
-    status: 'active',
-    claimers: []
-  };
-  items.push(newItem);
-  res.json(newItem);
+// ---------- Вспомогательные функции ----------
+const getUserByTag = (tag) => db.getAsync(`SELECT * FROM users WHERE tag = ?`, [tag]);
+const getUserByTelegramId = (telegram_id) => db.getAsync(`SELECT * FROM users WHERE telegram_id = ?`, [telegram_id]);
+const getUserById = (id) => db.getAsync(`SELECT * FROM users WHERE id = ?`, [id]);
+
+// ---------- API Роуты ----------
+
+// 1. Регистрация пользователя (без Telegram, но с проверкой тега)
+app.post('/api/auth/register', async (req, res) => {
+    const { nickname, tag, dorm, telegram_id } = req.body;
+    if (!nickname || !tag || !dorm) {
+        return res.status(400).json({ error: 'Все поля обязательны' });
+    }
+    // Проверка формата тега: @username, длина 3-32 символа, только буквы, цифры, _
+    const tagRegex = /^@[a-zA-Z0-9_]{2,31}$/;
+    if (!tagRegex.test(tag)) {
+        return res.status(400).json({ error: 'Тег должен начинаться с @ и содержать только буквы, цифры, подчёркивание (минимум 3 символа)' });
+    }
+    try {
+        let user = await getUserByTag(tag);
+        if (user) {
+            // Если пользователь уже существует, обновляем ник и общежитие
+            await db.runAsync(`UPDATE users SET nickname = ?, dorm = ?, telegram_id = COALESCE(?, telegram_id) WHERE id = ?`,
+                [nickname, dorm, telegram_id || null, user.id]);
+            user = { ...user, nickname, dorm };
+            return res.json({ user });
+        } else {
+            const result = await db.runAsync(
+                `INSERT INTO users (nickname, tag, dorm, telegram_id) VALUES (?, ?, ?, ?)`,
+                [nickname, tag, dorm, telegram_id || null]
+            );
+            const newUser = await getUserById(result.lastID);
+            return res.status(201).json({ user: newUser });
+        }
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка базы данных' });
+    }
 });
 
-app.post('/api/items/:id/claim', (req, res) => {
-  res.json({ bot_link: 'https://t.me/YourBot?start=test' });
+// 2. Получение активных объявлений (лента)
+app.get('/api/items', async (req, res) => {
+    try {
+        const items = await db.allAsync(`
+            SELECT i.*, u.nickname as owner_nick, u.tag as owner_tag, u.trust_level as owner_trust
+            FROM items i
+            JOIN users u ON i.owner_id = u.id
+            WHERE i.status = 'active'
+            ORDER BY i.created_at DESC
+        `);
+        res.json(items);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка базы данных' });
+    }
 });
 
-app.get('/api/items/my', (req, res) => res.json([]));
-app.get('/api/requests/my', (req, res) => res.json([]));
-app.get('/api/auth/telegram', (req, res) => res.json({ status: 'ok' }));
+// 3. Создание объявления (с фото)
+app.post('/api/items', upload.single('photo'), async (req, res) => {
+    const { title, description, category, owner_telegram_id } = req.body;
+    if (!title || !category || !owner_telegram_id) {
+        return res.status(400).json({ error: 'Название, категория и ID владельца обязательны' });
+    }
+    if (!req.file) return res.status(400).json({ error: 'Фото обязательно' });
+    try {
+        let user = await db.getAsync(`SELECT * FROM users WHERE tag = ?`, [owner_telegram_id]);
+        if (!user) user = await db.getAsync(`SELECT * FROM users WHERE telegram_id = ?`, [owner_telegram_id]);
+        if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+        const photo_path = `/uploads/${req.file.filename}`;
+        const result = await db.runAsync(
+            `INSERT INTO items (owner_telegram_id, title, description, category, photo_path) VALUES (?, ?, ?, ?, ?)`,
+            [user.telegram_id, title, description, category, photo_path]
+        );
+        const newItem = await db.getAsync(`SELECT * FROM items WHERE id = ?`, [result.lastID]);
+        res.status(201).json(newItem);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка базы данных' });
+    }
+});
 
-app.listen(8001, () => console.log('✅ Мок‑сервер запущен на http://localhost:8001'));
+// 4. Мои объявления (я отдаю)
+app.get('/api/items/my', async (req, res) => {
+    const { telegram_id } = req.query;
+    if (!telegram_id) return res.status(400).json({ error: 'telegram_id обязателен' });
+    try {
+        let user = await getUserByTelegramId(telegram_id);
+        if (!user) {
+            const fallback = await db.getAsync(`SELECT * FROM users WHERE tag = ?`, [telegram_id]);
+            if (!fallback) return res.json([]);
+            user = fallback;
+        }
+        const items = await db.allAsync(`
+            SELECT i.*,
+                (SELECT json_group_array(
+                    json_object('nick', u2.tag, 'rating', u2.trust_level, 'info', 'Передал вещей')
+                ) FROM claims c
+                JOIN users u2 ON c.user_id = u2.id
+                WHERE c.item_id = i.id AND c.status = 'pending'
+                ) as claimers
+            FROM items i
+            WHERE i.owner_id = ?
+            ORDER BY i.created_at DESC
+        `, [user.id]);
+        const parsed = items.map(item => ({
+            ...item,
+            claimers: item.claimers ? JSON.parse(item.claimers) : []
+        }));
+        res.json(parsed);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка базы данных' });
+    }
+});
+
+// 5. Создание заявки "заберу"
+app.post('/api/items/:id/claim', async (req, res) => {
+    const itemId = parseInt(req.params.id);
+    let { user_telegram_id } = req.body;
+    if (!user_telegram_id) return res.status(400).json({ error: 'user_telegram_id required' });
+    // Преобразуем в число, если пришла строка
+    if (typeof user_telegram_id === 'string') user_telegram_id = parseInt(user_telegram_id);
+    if (isNaN(user_telegram_id)) return res.status(400).json({ error: 'Invalid user_telegram_id' });
+    try {
+        const user = await db.getAsync(`SELECT id, telegram_id FROM users WHERE telegram_id = ?`, [user_telegram_id]);
+        if (!user) return res.status(404).json({ error: 'User not found. Please register first.' });
+        const item = await db.getAsync(`SELECT id, owner_telegram_id, title FROM items WHERE id = ? AND status = 'active'`, [itemId]);
+        if (!item) return res.status(404).json({ error: 'Item not found or inactive' });
+        if (item.owner_telegram_id === user_telegram_id) return res.status(400).json({ error: 'Cannot claim your own item' });
+        const existing = await db.getAsync(`SELECT id FROM conversation WHERE item_id = ? AND seeker_telegram_id = ? AND status = 'active'`, [itemId, user_telegram_id]);
+        if (existing) return res.status(400).json({ error: 'You already claimed this item' });
+        const token = require('crypto').randomBytes(16).toString('hex');
+        await db.runAsync(
+            `INSERT INTO conversation (item_id, owner_telegram_id, seeker_telegram_id, token) VALUES (?, ?, ?, ?)`,
+            [itemId, item.owner_telegram_id, user_telegram_id, token]
+        );
+        const bot_link = `https://t.me/${BOT_USERNAME}?start=${token}`;
+        res.json({ success: true, bot_link, token });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// 6. Мои заявки (я хочу)
+app.get('/api/requests/my', async (req, res) => {
+    const { telegram_id } = req.query;
+    if (!telegram_id) return res.status(400).json({ error: 'telegram_id обязателен' });
+    try {
+        let user = await getUserByTelegramId(telegram_id);
+        if (!user) {
+            const fallback = await db.getAsync(`SELECT * FROM users WHERE tag = ?`, [telegram_id]);
+            if (!fallback) return res.json([]);
+            user = fallback;
+        }
+        const claims = await db.allAsync(`
+            SELECT c.id, c.item_id, c.status, c.queue_position, c.token, c.created_at,
+                   i.title, i.description, i.photo_path,
+                   u.nickname as owner_nick, u.tag as owner_tag
+            FROM claims c
+            JOIN items i ON c.item_id = i.id
+            JOIN users u ON i.owner_id = u.id
+            WHERE c.user_id = ?
+            ORDER BY c.created_at DESC
+        `, [user.id]);
+        const formatted = claims.map(c => ({
+            id: c.id,
+            item_id: c.item_id,
+            title: c.title,
+            description: c.description,
+            state: c.status === 'accepted' ? 'selected' : (c.queue_position === 1 ? 'first' : 'queue'),
+            position: c.queue_position,
+            timer: null,
+            token: c.token,
+            status: c.status
+        }));
+        res.json(formatted);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка базы данных' });
+    }
+});
+
+// 7. Изменение статуса объявления (опционально)
+app.put('/api/items/:id/status', async (req, res) => {
+    const { status } = req.body;
+    if (!['active', 'reserved', 'completed'].includes(status)) {
+        return res.status(400).json({ error: 'Неверный статус' });
+    }
+    await db.runAsync(`UPDATE items SET status = ? WHERE id = ?`, [status, req.params.id]);
+    res.json({ success: true });
+});
+
+// Запуск сервера
+initDB().then(() => {
+    app.listen(PORT, () => {
+        console.log(`🚀 Сервер запущен на http://localhost:${PORT}`);
+    });
+    require('./bot'); // запуск бота
+}).catch(err => {
+    console.error('❌ Не удалось инициализировать БД', err);
+});

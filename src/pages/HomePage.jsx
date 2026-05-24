@@ -7,45 +7,35 @@ import { demoFeedItems } from '../utils/demoData';
 const API_BASE = 'http://localhost:8001';
 
 const HomePage = ({ onOpenCreate, refreshTrigger }) => {
-    const { telegramId, nickname } = useAuth();
+    const { user } = useAuth();
     const [items, setItems] = useState([]);
     const [category, setCategory] = useState('Все');
-    const [loading, setLoading] = useState(true);
 
     useEffect(() => {
         loadItems();
     }, [refreshTrigger]);
 
     const loadItems = async () => {
-        setLoading(true);
         try {
             const data = await fetchItems();
-            if (data && data.length > 0) {
-                setItems(data);
-            } else {
-                // если API вернул пустой массив, показываем демо
-                setItems(demoFeedItems);
-            }
+            if (data && data.length > 0) setItems(data);
+            else setItems(demoFeedItems);
         } catch (error) {
-            console.warn('Ошибка загрузки с API, использую демо-данные', error);
+            console.warn(error);
             setItems(demoFeedItems);
-        } finally {
-            setLoading(false);
         }
     };
 
     const handleClaim = async (itemId, status) => {
-        if (!telegramId) {
+        if (!user) {
             alert('Сначала авторизуйтесь');
             return;
         }
-        // Обработка в зависимости от статуса (как в оригинале)
         if (status === 'queue') {
             alert('Добавлен в список желающих');
             return;
         }
         if (status === 'mine') {
-            // перейти на страницу "Мои передачи"
             window.location.href = '/items';
             return;
         }
@@ -53,13 +43,16 @@ const HomePage = ({ onOpenCreate, refreshTrigger }) => {
             alert('Вещь уже в резерве');
             return;
         }
-        // для available идёт запрос на сервер
-        const result = await claimItem(itemId, telegramId);
-        if (result.bot_link) {
-            window.open(result.bot_link, '_blank');
-            await loadItems(); // обновим ленту
-        } else {
-            alert('Не удалось забрать вещь');
+        try {
+            const result = await claimItem(itemId, user.telegram_id);
+            if (result.bot_link) {
+                window.open(result.bot_link, '_blank');
+                await loadItems();
+            } else {
+                alert('Не удалось забрать вещь');
+            }
+        } catch (err) {
+            alert(err.message);
         }
     };
 
@@ -68,21 +61,16 @@ const HomePage = ({ onOpenCreate, refreshTrigger }) => {
 
     const getButtonByStatus = (item) => {
         switch (item.status) {
-            case 'available':
-                return <button className="action-btn take-btn" onClick={() => handleClaim(item.id, 'available')}>Заберу</button>;
-            case 'queue':
-                return <button className="action-btn queue-btn" onClick={() => handleClaim(item.id, 'queue')}>Я тоже хочу</button>;
-            case 'reserved':
-                return <button className="action-btn reserved-btn">В резерве</button>;
-            case 'mine':
-                return <button className="action-btn manage-btn" onClick={() => handleClaim(item.id, 'mine')}>Управлять</button>;
-            default:
-                return <button className="action-btn take-btn" onClick={() => handleClaim(item.id, 'available')}>Заберу</button>;
+            case 'available': return <button className="action-btn take-btn" onClick={() => handleClaim(item.id, 'available')}>Заберу</button>;
+            case 'queue': return <button className="action-btn queue-btn" onClick={() => handleClaim(item.id, 'queue')}>Я тоже хочу</button>;
+            case 'reserved': return <button className="action-btn reserved-btn">В резерве</button>;
+            case 'mine': return <button className="action-btn manage-btn" onClick={() => handleClaim(item.id, 'mine')}>Управлять</button>;
+            default: return <button className="action-btn take-btn" onClick={() => handleClaim(item.id, 'available')}>Заберу</button>;
         }
     };
 
     return (
-        <div className="page active" id="homePage">
+        <div className="page active">
             <div className="topbar">
                 <div className="logo">Тут</div>
                 <div className="top-right">
@@ -107,7 +95,7 @@ const HomePage = ({ onOpenCreate, refreshTrigger }) => {
             <div className="feed-grid">
                 {filtered.map(item => (
                     <div key={item.id} className="card">
-                        <div className="card-image" style={{ backgroundImage: `url(${item.photo_path.startsWith('http') ? item.photo_path : `${API_BASE}/${item.photo_path}`})` }}>
+                        <div className="card-image" style={{ backgroundImage: `url(${item.photo_path?.startsWith('http') ? item.photo_path : `${API_BASE}/${item.photo_path}`})` }}>
                             <div className="card-badge">{item.category}</div>
                         </div>
                         <div className="card-content">
